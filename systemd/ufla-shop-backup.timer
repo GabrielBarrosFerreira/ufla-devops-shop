@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup diario as 3h
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# se a maquina estava desligada, roda ao ligar
+Persistent=true
+# evita que varios servidores disparem no mesmo segundo
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

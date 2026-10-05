@@ -1,0 +1,10 @@
+# /etc/systemd/system/ufla-shop-backup.service
+[Unit]
+Description=ufla-devops-shop: backup do banco loja (pg_dump)
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ufla-shop.env
+ExecStart=/opt/ufla-shop/scripts/backup.sh

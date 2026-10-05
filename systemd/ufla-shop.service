@@ -1,0 +1,19 @@
+[Unit]
+Description=API do ufla-devops-shop
+After=postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=ufla-shop
+Group=ufla-shop
+WorkingDirectory=/opt/ufla-shop
+EnvironmentFile=/etc/ufla-shop.env
+ExecStart=/opt/ufla-shop/.venv/bin/uvicorn app:api --port 8000
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
