@@ -1,0 +1,312 @@
+# =============================================================================
+# Pipeline DevSecOps do ufla-devops-shop  (Trabalho Pratico - Aula 8)
+#
+#   PR para a main / push na main
+#   |-- testes ............. ruff + pytest + cobertura  --> sonarcloud (SAST + Quality Gate)
+#   |-- gitleaks ........... segredos em TODO o historico do Git
+#   |-- trivy-deps ......... SCA: dependencias declaradas (requirements*.txt)
+#   |-- imagem ............. build UMA vez -> relatorio -> SBOM (Syft) -> gate (Trivy)
+#   `-- publicar ........... SO em push na main e SO se todos os jobs acima passarem
+#
+# Regras de bloqueio:
+#   gitleaks    qualquer segredo encontrado ........................ FALHA
+#   sonarcloud  Quality Gate do CODIGO NOVO reprovado ............... FALHA
+#   trivy       CRITICAL/HIGH com correcao disponivel ............... FALHA
+#               LOW/MEDIUM, ou sem correcao ......................... so relatorio
+#   syft        SBOM e artefato: nunca bloqueia
+#
+# Actions de terceiros fixadas por SHA de commit (a tag fica no comentario):
+# uma tag pode ser reapontada por quem a controla - foi o que aconteceu com a
+# aquasecurity/trivy-action em marco/2026 (CVE-2026-33634).
+# =============================================================================
+name: DevSecOps CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  GITLEAKS_VERSION: "8.30.1"
+  IMAGEM_LOCAL: ufla-shop:${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate de qualidade da semana 7: lint, testes e cobertura
+  # ---------------------------------------------------------------------------
+  testes:
+    name: Testes (lint, pytest e cobertura)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar dependencias de desenvolvimento
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Testes com cobertura
+        run: pytest --cov=app --cov-report=xml --cov-report=term
+
+      - name: Guardar a cobertura para o SonarCloud
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cobertura
+          path: coverage.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Requisito 1 - Gitleaks: segredos em TODO o historico
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: Gitleaks (segredos no historico)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # historico COMPLETO, nao so o ultimo commit
+          persist-credentials: false
+
+      - name: Instalar o gitleaks (versao fixa + verificacao de checksum)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          pacote="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "${base}/${pacote}"
+          curl -sSfLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${pacote}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "${pacote}" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Varrer todo o historico do Git
+        run: |
+          set +e
+          # HEAD = commit avaliado. Num PR e o merge "main + PR": a varredura cobre
+          # toda a historia da main mais todos os commits do PR, um por um.
+          gitleaks git . --redact --verbose --no-banner \
+            --log-opts="--full-history --diff-filter=tuxdb HEAD"
+          status=$?
+          commits=$(git rev-list --count HEAD)
+          if [ "$status" -eq 0 ]; then
+            echo "### Gitleaks: nenhum segredo encontrado em ${commits} commits" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Gitleaks: POSSIVEL VAZAMENTO DE SEGREDO - veja o log deste passo" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+  # ---------------------------------------------------------------------------
+  # Requisito 2 - SonarCloud: SAST + Quality Gate sobre o codigo novo
+  # (organizacao, projeto e "qualitygate.wait" ficam no sonar-project.properties)
+  # ---------------------------------------------------------------------------
+  sonarcloud:
+    name: SonarCloud (SAST e Quality Gate)
+    needs: testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # o Sonar precisa do historico para saber o que e "codigo novo"
+          persist-credentials: false
+
+      - name: Baixar a cobertura gerada pelos testes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cobertura
+
+      - name: Analise SAST e espera do Quality Gate
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Requisito 3a - Trivy nas dependencias declaradas (SCA)
+  # ---------------------------------------------------------------------------
+  trivy-deps:
+    name: Trivy (dependencias)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Relatorio completo - todas as severidades (nao bloqueia)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          skip-dirs: .cache
+          format: table
+          output: relatorio-trivy-dependencias.txt
+          exit-code: "0"
+
+      - name: Publicar o relatorio no resumo da execucao
+        if: always()
+        run: |
+          {
+            echo "## Trivy - dependencias: relatorio completo"
+            echo "Regra: bloqueia CRITICAL/HIGH com correcao disponivel. LOW/MEDIUM ficam so registrados aqui."
+            echo '```text'
+            cat relatorio-trivy-dependencias.txt 2>/dev/null || echo "(relatorio nao gerado)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar o relatorio como artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relatorio-trivy-dependencias
+          path: relatorio-trivy-dependencias.txt
+          retention-days: 30
+
+      - name: Gate - bloqueia CRITICAL/HIGH com correcao disponivel
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          skip-dirs: .cache
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+        env:
+          TRIVY_SKIP_DB_UPDATE: true
+
+  # ---------------------------------------------------------------------------
+  # Requisitos 3b e 4 - imagem: build UMA vez, Trivy na imagem e SBOM com Syft
+  # ---------------------------------------------------------------------------
+  imagem:
+    name: Imagem (build, Trivy e SBOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build da imagem (construida uma unica vez)
+        run: docker build -t "$IMAGEM_LOCAL" .
+
+      - name: Relatorio completo da imagem - todas as severidades (nao bloqueia)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGEM_LOCAL }}
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          format: table
+          output: relatorio-trivy-imagem.txt
+          exit-code: "0"
+
+      - name: Gerar o SBOM da imagem (Syft, SPDX JSON)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGEM_LOCAL }}
+          format: spdx-json
+          output-file: sbom-ufla-shop.spdx.json
+          artifact-name: sbom-ufla-shop.spdx.json
+          upload-release-assets: false
+
+      - name: Publicar o relatorio e o resumo do SBOM
+        if: always()
+        run: |
+          {
+            echo "## SBOM (Syft): $(jq '.packages | length' sbom-ufla-shop.spdx.json 2>/dev/null || echo '?') componentes inventariados"
+            echo "## Trivy - imagem: relatorio completo"
+            echo "Regra: bloqueia CRITICAL/HIGH com correcao disponivel. LOW/MEDIUM ficam so registrados aqui."
+            echo '```text'
+            cat relatorio-trivy-imagem.txt 2>/dev/null || echo "(relatorio nao gerado)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar o relatorio da imagem como artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relatorio-trivy-imagem
+          path: relatorio-trivy-imagem.txt
+          retention-days: 30
+
+      - name: Gate - bloqueia CRITICAL/HIGH com correcao disponivel
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGEM_LOCAL }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+        env:
+          TRIVY_SKIP_DB_UPDATE: true
+
+      - name: Exportar a imagem aprovada para o job de publicacao
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker save "$IMAGEM_LOCAL" | gzip > imagem-aprovada.tar.gz
+
+      - name: Guardar a imagem aprovada
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: imagem-aprovada
+          path: imagem-aprovada.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Publicacao: depende de TODAS as verificacoes e so roda em push na main.
+  # Publica a MESMA imagem que foi verificada (construa uma vez, implante muitas).
+  # ---------------------------------------------------------------------------
+  publicar:
+    name: Publicar imagem no GHCR
+    needs: [testes, gitleaks, sonarcloud, trivy-deps, imagem]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # permissao minima para publicar no GHCR
+    steps:
+      - name: Baixar a imagem que passou por todas as verificacoes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: imagem-aprovada
+
+      - name: Carregar, versionar e publicar
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }} # token efemero do proprio job
+          ATOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          docker load --input imagem-aprovada.tar.gz
+          destino="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}"
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "$ATOR" --password-stdin
+          docker tag "$IMAGEM_LOCAL" "$destino"
+          docker push "$destino"
+          echo "### Imagem publicada: \`${destino}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,11 @@
+# Excecoes do Trivy - politica da disciplina (Aula 8, perguntas 1 e 4)
+#
+# Uma CVE so entra aqui quando NAO ha correcao possivel agora e a exposicao foi
+# avaliada. Toda linha precisa de justificativa, responsavel e data de revisao.
+# Nunca "resolva" um bloqueio desligando o gate (exit-code 0): isso desliga a
+# protecao para todas as entregas futuras.
+#
+# Formato:
+# CVE-AAAA-NNNNN   # motivo | responsavel: @usuario | revisar em: AAAA-MM-DD
+#
+# (nenhuma excecao ativa)

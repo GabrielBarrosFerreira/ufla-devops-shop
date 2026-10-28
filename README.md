@@ -11,6 +11,116 @@ e provisionada, semana após semana.
 
 ---
 
+## Trabalho Prático — Pipeline DevSecOps com GitHub Actions
+
+> Fork de **Gabriel Barros Ferreira** (`GabrielBarrosFerreira`) · DevOps na Prática, 2026/2 · Aula 8 — *shift-left security*
+
+Todo Pull Request para a `main` e todo push na `main` passam pela esteira
+[`.github/workflows/devsecops.yml`](.github/workflows/devsecops.yml). Nenhuma
+mudança entra na `main` — e nenhuma imagem é publicada — sem passar por
+segredos (Gitleaks), SAST (SonarCloud), SCA nas dependências e na imagem (Trivy)
+e inventário de componentes (SBOM com Syft).
+
+```mermaid
+flowchart LR
+    E([PR para a main<br/>ou push na main]) --> T[Testes<br/>ruff + pytest + cobertura]
+    E --> G[Gitleaks<br/>segredos no histórico]
+    E --> D[Trivy fs<br/>dependências]
+    E --> I[Imagem<br/>build → relatório → SBOM → gate Trivy]
+    T --> S[SonarCloud<br/>SAST + Quality Gate]
+    T & G & D & I & S --> P{{Publicar no GHCR<br/>só em push na main}}
+```
+
+### Ferramentas, verificações e regras de bloqueio
+
+| Check obrigatório | Ferramenta | O que verifica | Bloqueia quando |
+|---|---|---|---|
+| `Gitleaks (segredos no historico)` | Gitleaks 8.30.1 | Cada commit da história até o commit avaliado — num PR, toda a `main` mais os commits do PR | **Qualquer** segredo encontrado (senha, token, chave) |
+| `SonarCloud (SAST e Quality Gate)` | SonarQube Cloud | Código Python (`app/`) e front (`static/`), com a cobertura do pytest | Quality Gate **Sonar way** reprovado no **código novo** (problema novo de segurança ou confiabilidade, *security hotspot* não revisado, cobertura ou duplicação fora do limite) |
+| `Trivy (dependencias)` | Trivy 0.70 (`trivy fs`) | Dependências declaradas em `requirements*.txt` | CVE **CRITICAL ou HIGH com correção disponível** |
+| `Imagem (build, Trivy e SBOM)` | Docker + Trivy (`trivy image`) + Syft | Pacotes do Alpine e bibliotecas Python **dentro da imagem** | Mesma regra do Trivy; o SBOM é artefato e nunca bloqueia |
+| `Testes (lint, pytest e cobertura)` | ruff + pytest + pytest-cov | Gate de qualidade da semana 7 | Lint ou teste falhando |
+
+**LOW e MEDIUM — e CVEs sem correção publicada — não bloqueiam:** ficam
+registradas no relatório completo do Trivy (resumo da execução e artifacts
+`relatorio-trivy-dependencias` e `relatorio-trivy-imagem`). Exceção pontual só
+pelo [`.trivyignore`](.trivyignore), com justificativa, responsável e data de
+revisão — nunca com `exit-code: 0`.
+
+**Publicação:** o job `Publicar imagem no GHCR` depende de **todos** os checks
+acima e só roda em push na `main`. Ele publica a **mesma imagem** que foi
+construída e verificada no job `imagem` (salva como artifact), em
+`ghcr.io/gabrielbarrosferreira/ufla-devops-shop:sha-<commit>` — tag imutável.
+
+**Proteção da `main`** (ruleset `proteger-main`): Pull Request obrigatório, os
+cinco checks acima obrigatórios, sem *force push*, sem deleção da branch e sem
+*bypass*.
+
+### Onde ver cada resultado
+
+| O quê | Onde |
+|---|---|
+| Execuções da esteira | Aba **Actions** → workflow `DevSecOps CI/CD` |
+| Relatório completo do Trivy | Resumo (*Summary*) de cada execução + artifacts `relatorio-trivy-*` |
+| SBOM (SPDX JSON) | Artifact `sbom-ufla-shop.spdx.json` de cada execução |
+| Análise estática | [SonarCloud — código novo](https://sonarcloud.io/summary/new_code?id=GabrielBarrosFerreira_ufla-devops-shop) |
+| Imagens publicadas | [Pacote no GHCR](https://github.com/users/GabrielBarrosFerreira/packages/container/package/ufla-devops-shop) |
+| PRs de demonstração | [Pull Requests deste fork](https://github.com/GabrielBarrosFerreira/ufla-devops-shop/pulls?q=is%3Apr) |
+
+### Demonstração do bloqueio e da correção (Requisito 5)
+
+1. **PR `teste-cve`** — adiciona `urllib3==1.26.4`, versão com CVEs HIGH
+   conhecidas e com correção (ex.: CVE-2021-33503, corrigida na 1.26.5;
+   CVE-2023-43804, corrigida na 1.26.17). Os checks `Trivy (dependencias)` e
+   `Imagem (build, Trivy e SBOM)` falham e o merge fica bloqueado.
+2. **Correção no mesmo PR** — `urllib3==2.8.0` (sem CVE conhecida). Todos os
+   checks passam e o merge é liberado. A versão vulnerável nunca chegou à
+   `main` nem ao GHCR.
+3. **PR `teste-gitleaks`** — chave de API **falsa**, gerada aleatoriamente. O
+   Gitleaks bloqueia; o PR foi fechado sem merge e a branch, apagada.
+
+### Decisões de projeto (o porquê)
+
+- **`urllib3==1.26.4` em vez do `requests==2.19.1` sugerido em aula.** O
+  requests 2.19.1 exige `idna<2.8`, mas FastAPI → Starlette → AnyIO exige
+  `idna>=2.8`: o pip não encontra combinação possível e o build quebraria por
+  conflito de dependências — não pela segurança. O urllib3 é o motor HTTP do
+  próprio requests e instala sem conflito, então a falha observada é
+  exclusivamente a do gate.
+- **Actions fixadas por SHA de commit.** Em 19/03/2026, 76 das 77 tags da
+  `aquasecurity/trivy-action` foram reapontadas para código que roubava
+  credenciais ([CVE-2026-33634](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23));
+  a `@0.28.0` está no intervalo afetado. A `SonarSource/sonarqube-scan-action`
+  v4 tem duas falhas HIGH de injeção (corrigidas na 5.3.1 e na 6.0.0). Por
+  isso: versões corrigidas e `uses: dono/action@<sha> # vX.Y.Z`. O Gitleaks é
+  baixado em versão fixa e conferido por checksum.
+- **Construa uma vez, publique a mesma.** A imagem verificada pelo Trivy é
+  exatamente a imagem publicada — nada é reconstruído depois do gate.
+- **`apk upgrade` no Dockerfile.** O gate só bloqueia CVE com correção
+  disponível; atualizar os pacotes do Alpine no build aplica essas correções e
+  ataca a causa mais comum de bloqueio vinda da imagem base.
+- **Por que LOW/MEDIUM não bloqueiam.** Um gate que barra tudo vira ruído, e a
+  equipe aprende a ignorá-lo — inclusive o CRITICAL de verdade. Começa-se
+  bloqueando pouco e aperta-se a régua com o tempo.
+- **Segredos.** O único segredo de longa duração é o `SONAR_TOKEN` (GitHub
+  Secrets). A publicação usa o `GITHUB_TOKEN` efêmero do job, com
+  `packages: write` apenas no job `publicar`; o padrão é `contents: read`.
+
+### Reproduzir localmente
+
+```bash
+gitleaks git . --redact -v                                   # segredos em todo o histórico
+trivy fs --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 .
+docker build -t ufla-shop:local .
+trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 ufla-shop:local
+syft ufla-shop:local -o spdx-json > sbom.spdx.json           # SBOM
+```
+
+> O workflow `Atividade 0` (corretor automático do repositório do professor)
+> fica desabilitado neste fork: ele só faz sentido no repositório da turma.
+
+---
+
 ## Comece por aqui
 
 1. Instale as ferramentas: **[docs/instalacao.md](docs/instalacao.md)**

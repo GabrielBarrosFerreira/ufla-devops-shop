@@ -8,7 +8,11 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # ---------- Estágio 2: imagem final ----------
 FROM python:3.12-alpine
 
-RUN adduser -D -u 10001 ufla-shop \
+# DevSecOps: aplica as correções de segurança já publicadas para os pacotes do
+# Alpine. O gate do Trivy só bloqueia CVE CRITICAL/HIGH que TEM correção — e a
+# correção, quando existe, chega por aqui.
+RUN apk upgrade --no-cache \
+ && adduser -D -u 10001 ufla-shop \
  && mkdir -p /opt/ufla-shop \
  && chown ufla-shop /opt/ufla-shop
 
